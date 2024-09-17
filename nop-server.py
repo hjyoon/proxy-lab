@@ -1,5 +1,3 @@
-#!/usr/bin/python
-
 # nop-server.py - This is a server that we use to create head-of-line
 #                 blocking for the concurrency test. It accepts a
 #                 connection, and then spins forever.
