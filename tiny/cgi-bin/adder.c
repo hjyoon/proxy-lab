@@ -6,7 +6,7 @@
 
 int main(void) {
   char* buf;
-  char* p;
+  // char* p;
   char arg1[MAXLINE];
   char arg2[MAXLINE];
   char content[MAXLINE];

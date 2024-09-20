@@ -17,6 +17,11 @@ void forward_request(int clientfd);
 void handle_response(int serverfd, int clientfd);
 void send_error(int clientfd, int status, const char *short_msg, const char *long_msg);
 
+void sigchld_handler(int sig) {
+  while (waitpid(-1, 0, WNOHANG) > 0);
+  return;
+}
+
 /* Main function: listens for incoming connections and forwards requests */
 int main(int argc, char* argv[]) {
     int listenfd, connfd;
@@ -30,8 +35,9 @@ int main(int argc, char* argv[]) {
     }
 
     /* Ignore SIGPIPE to prevent server from terminating when writing to a closed socket */
-    Signal(SIGPIPE, SIG_IGN);
+    // Signal(SIGPIPE, SIG_IGN);
 
+    Signal(SIGCHLD, sigchld_handler);
     listenfd = Open_listenfd(argv[1]);
     if (listenfd < 0) {
         perror("Open_listenfd failed");
@@ -49,7 +55,15 @@ int main(int argc, char* argv[]) {
         Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
         printf("Accepted connection from (%s, %s)\n", hostname, port);
 
-        forward_request(connfd);
+        // forward_request(connfd);
+
+        if (Fork() == 0) {
+            Close(listenfd);
+            forward_request(connfd);
+            printf("Disconnected from (%s, %s)\n", hostname, port);
+            Close(connfd);
+            exit(0);
+        }
         Close(connfd);
     }
 

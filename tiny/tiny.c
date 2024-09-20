@@ -16,9 +16,12 @@ void get_filetype(char *filename, char *filetype);
 void serve_dynamic(int fd, char *filename, char *cgiargs, int no_body);
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
 
-int main(int argc, char **argv) {
-  signal(SIGPIPE, SIG_IGN);
+void sigchld_handler(int sig) {
+  while (waitpid(-1, 0, WNOHANG) > 0);
+  return;
+}
 
+int main(int argc, char* argv[]) {
   int listenfd, connfd;
   char hostname[MAXLINE], port[MAXLINE];
   socklen_t clientlen;
@@ -30,16 +33,23 @@ int main(int argc, char **argv) {
     exit(1);
   }
 
+  Signal(SIGCHLD, sigchld_handler);
   listenfd = Open_listenfd(argv[1]);
   while (1) {
     clientlen = sizeof(clientaddr);
     connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);  // line:netp:tiny:accept
-
     Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
     printf("Accepted connection from (%s, %s)\n", hostname, port);
-    doit(connfd);   // line:netp:tiny:doit
+    if (Fork() == 0) {
+      Close(listenfd);
+      doit(connfd);
+      printf("Disconnected from (%s, %s)\n", hostname, port);
+      Close(connfd);
+      exit(0);
+    }
     Close(connfd);  // line:netp:tiny:close
   }
+  exit(0);
 }
 
 void doit(int fd) {
@@ -57,8 +67,8 @@ void doit(int fd) {
   /* Read request line and headers */
   Rio_readinitb(&rio, fd);
   Rio_readlineb(&rio, buf, MAXLINE);
-  printf("Request headers:\n");
-  printf("%s", buf);
+  // printf("Request headers:\n");
+  // printf("%s", buf);
   sscanf(buf, "%s %s %s", method, uri, version);
   if (strcasecmp(method, "GET") == 0) {
     no_body = 0;
@@ -118,7 +128,7 @@ void read_requesthdrs(rio_t* rp) {
     if (strcmp(buf, "\r\n") == 0) {
       break;
     }
-    printf("%s", buf);
+    // printf("%s", buf);
   }
 }
 
@@ -155,14 +165,23 @@ void serve_static(int fd, char* filename, int filesize, int no_body) {
 
   /* Send response headers to client */
   get_filetype(filename, filetype);
-  snprintf(buf, MAXBUF - strlen(buf), "HTTP/1.0 200 OK\r\n");
-  snprintf(buf + strlen(buf), MAXBUF - strlen(buf), "Server: Tiny Web Server\r\n");
-  snprintf(buf + strlen(buf), MAXBUF - strlen(buf), "Connection: close\r\n");
-  snprintf(buf + strlen(buf), MAXBUF - strlen(buf), "Content-length: %d\r\n", filesize);
-  snprintf(buf + strlen(buf), MAXBUF - strlen(buf), "Content-type: %s\r\n\r\n", filetype);
+
+  int len = snprintf(buf, MAXBUF,
+                       "HTTP/1.0 200 OK\r\n"
+                       "Server: Tiny Web Server\r\n"
+                       "Connection: close\r\n"
+                       "Content-length: %d\r\n"
+                       "Content-type: %s\r\n\r\n",
+                       filesize, filetype);
+
+  if (len >= MAXBUF) {
+    fprintf(stderr, "Error: Response headers truncated.\n");
+    return;
+  }
+
   Rio_writen(fd, buf, strlen(buf));
-  printf("Response headers:\n");
-  printf("%s", buf);
+  // printf("Response headers:\n");
+  // printf("%s", buf);
 
   if (no_body) {
     return;
@@ -194,6 +213,73 @@ void serve_static(int fd, char* filename, int filesize, int no_body) {
   // Munmap(srcp, filesize); // Mmap 사용 시
   Free(srcp); // Malloc 사용 시
 }
+
+// void serve_static(int fd, char* filename, int filesize, int no_body) {
+//     int srcfd;
+//     char* srcp;
+//     char filetype[MAXLINE];
+//     char buf[MAXBUF];
+
+//     /* Send response headers to client */
+//     get_filetype(filename, filetype);
+//     buf[0] = '\0'; // 버퍼를 빈 문자열로 초기화
+
+//     // "HTTP/1.0 200 OK\r\n" 헤더 추가
+//     strncpy(buf, "HTTP/1.0 200 OK\r\n", MAXBUF - 1);
+//     buf[MAXBUF - 1] = '\0'; // null 종료 문자 보장
+
+//     // "Server: Tiny Web Server\r\n" 헤더 추가
+//     strncat(buf, "Server: Tiny Web Server\r\n", MAXBUF - strlen(buf) - 1);
+
+//     // "Connection: close\r\n" 헤더 추가
+//     strncat(buf, "Connection: close\r\n", MAXBUF - strlen(buf) - 1);
+
+//     // "Content-length: <filesize>\r\n" 헤더 추가
+//     char content_length[MAXLINE];
+//     snprintf(content_length, sizeof(content_length), "Content-length: %d\r\n", filesize);
+//     strncat(buf, content_length, MAXBUF - strlen(buf) - 1);
+
+//     // "Content-type: <filetype>\r\n\r\n" 헤더 추가
+//     char content_type[MAXLINE];
+//     snprintf(content_type, sizeof(content_type), "Content-type: %s\r\n\r\n", filetype);
+//     strncat(buf, content_type, MAXBUF - strlen(buf) - 1);
+
+//     // 클라이언트로 헤더 전송
+//     Rio_writen(fd, buf, strlen(buf));
+
+//     // 헤더 로그 출력
+//     printf("Response headers:\n");
+//     printf("%s", buf);
+
+//     if (no_body) {
+//         return;
+//     }
+
+//     /* Send response body to client */
+//     srcfd = Open(filename, O_RDONLY, 0);
+//     // 에러 처리 (주석 처리된 부분)
+//     // if (srcfd < 0) {
+//     //     perror("Open failed");
+//     //     return;
+//     // }
+
+//     // 파일 내용을 메모리로 읽기
+//     srcp = (char *)Malloc(filesize);
+//     if (Rio_readn(srcfd, srcp, filesize) < 0) {
+//         perror("Read failed");
+//         Free(srcp);
+//         Close(srcfd);
+//         return;
+//     }
+
+//     Close(srcfd);
+
+//     // 파일 내용을 클라이언트로 전송
+//     Rio_writen(fd, srcp, filesize);
+
+//     // 메모리 해제
+//     Free(srcp);
+// }
 
 /*
  * get_filetype - Derive file type from filename
