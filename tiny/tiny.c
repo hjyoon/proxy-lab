@@ -16,9 +16,77 @@ void get_filetype(char *filename, char *filetype);
 void serve_dynamic(int fd, char *filename, char *cgiargs, int no_body);
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
 
-void sigchld_handler(int sig) {
-  while (waitpid(-1, 0, WNOHANG) > 0);
-  return;
+typedef struct { /* Represents a pool of connected descriptors */
+  int maxfd; /* Largest descriptor in read_set */
+  fd_set read_set; /* Set of all active descriptors */
+  fd_set ready_set; /* Subset of descriptors ready for reading */
+  int nready; /* Number of ready descriptors from select */
+  int maxi; /* High water index into client array */
+  int clientfd[FD_SETSIZE]; /* Set of active descriptors */
+  rio_t clientrio[FD_SETSIZE]; /* Set of active read buffers */
+} pool;
+
+void init_pool(int listenfd, pool* p) {
+  /* Initially, there are no connected descriptors */
+  int i;
+  p->maxi = -1;
+  for(i=0; i<FD_SETSIZE; i++) {
+    p->clientfd[i] = -1;
+  }
+
+  /* Initially, listenfd is only member of select read set */
+  p->maxfd = listenfd;
+  FD_ZERO(&p->read_set);
+  FD_SET(listenfd, &p->read_set);
+}
+
+void add_client(int connfd, pool* p) {
+  int i;
+  p->nready--;
+  for(i=0; i<FD_SETSIZE; i++) { /* Find an available slot */
+    if(p->clientfd[i] < 0) {
+      /* Add connected descriptor to the pool */
+      p->clientfd[i] = connfd;
+      Rio_readinitb(&p->clientrio[i], connfd);
+
+      /* Add the descriptor to descriptor set */
+      FD_SET(connfd, &p->read_set);
+
+      /* Update max descriptor and pool highwater mark */
+      if(connfd > p->maxfd) {
+        p->maxfd = connfd;
+      }
+      if(i > p->maxi) {
+        p->maxi = i;
+      }
+
+      break;
+    }
+  }
+
+  if(i == FD_SETSIZE) { /* Couldn't find an empty slot */
+    app_error("add_client error: Too many clients");
+  }
+}
+
+void check_clients(pool* p) {
+  int i, connfd, n;
+  char buf[MAXLINE];
+  rio_t rio;
+
+  for(i=0; i<=(p->maxi) && (p->nready>0); i++) {
+    connfd = p->clientfd[i];
+    rio = p->clientrio[i];
+
+    /* If the descriptor is ready, echo a text line from it */
+    if((connfd > 0) && (FD_ISSET(connfd, &p->ready_set))) {
+      p->nready--;
+      doit(connfd);
+      Close(connfd);
+      FD_CLR(connfd, &p->read_set);
+      p->clientfd[i] = -1;
+    }
+  }
 }
 
 int main(int argc, char* argv[]) {
@@ -26,6 +94,7 @@ int main(int argc, char* argv[]) {
   char hostname[MAXLINE], port[MAXLINE];
   socklen_t clientlen;
   struct sockaddr_storage clientaddr;
+  static pool pool;
 
   /* Check command line args */
   if (argc != 2) {
@@ -33,21 +102,38 @@ int main(int argc, char* argv[]) {
     exit(1);
   }
 
-  Signal(SIGCHLD, sigchld_handler);
   listenfd = Open_listenfd(argv[1]);
+  init_pool(listenfd, &pool);
   while (1) {
-    clientlen = sizeof(clientaddr);
-    connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);  // line:netp:tiny:accept
-    Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
-    printf("Accepted connection from (%s, %s)\n", hostname, port);
-    if (Fork() == 0) {
-      Close(listenfd);
-      doit(connfd);
-      printf("Disconnected from (%s, %s)\n", hostname, port);
-      Close(connfd);
-      exit(0);
+    /* Wait for listening/connected descriptor(s) to become ready */
+    pool.ready_set = pool.read_set;
+    pool.nready = Select(pool.maxfd+1, &pool.ready_set, NULL, NULL, NULL);
+
+    // clientlen = sizeof(clientaddr);
+    // connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);  // line:netp:tiny:accept
+    // Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
+    // printf("Accepted connection from (%s, %s)\n", hostname, port);
+
+    /* If listening descriptor ready, add new client to pool */
+    if(FD_ISSET(listenfd, &pool.ready_set)) {
+      clientlen = sizeof(clientlen);
+      connfd = Accept(listenfd, (SA*)&clientaddr, &clientlen);
+      Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
+      printf("Accepted connection from (%s, %s)\n", hostname, port);
+      add_client(connfd, &pool);
     }
-    Close(connfd);  // line:netp:tiny:close
+
+    /* Echo a text line from each ready connected descriptor */
+    check_clients(&pool);
+
+    // if (Fork() == 0) {
+    //   Close(listenfd);
+    //   doit(connfd);
+    //   printf("Disconnected from (%s, %s)\n", hostname, port);
+    //   Close(connfd);
+    //   exit(0);
+    // }
+    // Close(connfd);  // line:netp:tiny:close
   }
   exit(0);
 }
@@ -67,8 +153,8 @@ void doit(int fd) {
   /* Read request line and headers */
   Rio_readinitb(&rio, fd);
   Rio_readlineb(&rio, buf, MAXLINE);
-  // printf("Request headers:\n");
-  // printf("%s", buf);
+  printf("Request headers:\n");
+  printf("%s", buf);
   sscanf(buf, "%s %s %s", method, uri, version);
   if (strcasecmp(method, "GET") == 0) {
     no_body = 0;
@@ -128,7 +214,7 @@ void read_requesthdrs(rio_t* rp) {
     if (strcmp(buf, "\r\n") == 0) {
       break;
     }
-    // printf("%s", buf);
+    printf("%s", buf);
   }
 }
 
@@ -180,8 +266,8 @@ void serve_static(int fd, char* filename, int filesize, int no_body) {
   }
 
   Rio_writen(fd, buf, strlen(buf));
-  // printf("Response headers:\n");
-  // printf("%s", buf);
+  printf("Response headers:\n");
+  printf("%s", buf);
 
   if (no_body) {
     return;
@@ -213,73 +299,6 @@ void serve_static(int fd, char* filename, int filesize, int no_body) {
   // Munmap(srcp, filesize); // Mmap 사용 시
   Free(srcp); // Malloc 사용 시
 }
-
-// void serve_static(int fd, char* filename, int filesize, int no_body) {
-//     int srcfd;
-//     char* srcp;
-//     char filetype[MAXLINE];
-//     char buf[MAXBUF];
-
-//     /* Send response headers to client */
-//     get_filetype(filename, filetype);
-//     buf[0] = '\0'; // 버퍼를 빈 문자열로 초기화
-
-//     // "HTTP/1.0 200 OK\r\n" 헤더 추가
-//     strncpy(buf, "HTTP/1.0 200 OK\r\n", MAXBUF - 1);
-//     buf[MAXBUF - 1] = '\0'; // null 종료 문자 보장
-
-//     // "Server: Tiny Web Server\r\n" 헤더 추가
-//     strncat(buf, "Server: Tiny Web Server\r\n", MAXBUF - strlen(buf) - 1);
-
-//     // "Connection: close\r\n" 헤더 추가
-//     strncat(buf, "Connection: close\r\n", MAXBUF - strlen(buf) - 1);
-
-//     // "Content-length: <filesize>\r\n" 헤더 추가
-//     char content_length[MAXLINE];
-//     snprintf(content_length, sizeof(content_length), "Content-length: %d\r\n", filesize);
-//     strncat(buf, content_length, MAXBUF - strlen(buf) - 1);
-
-//     // "Content-type: <filetype>\r\n\r\n" 헤더 추가
-//     char content_type[MAXLINE];
-//     snprintf(content_type, sizeof(content_type), "Content-type: %s\r\n\r\n", filetype);
-//     strncat(buf, content_type, MAXBUF - strlen(buf) - 1);
-
-//     // 클라이언트로 헤더 전송
-//     Rio_writen(fd, buf, strlen(buf));
-
-//     // 헤더 로그 출력
-//     printf("Response headers:\n");
-//     printf("%s", buf);
-
-//     if (no_body) {
-//         return;
-//     }
-
-//     /* Send response body to client */
-//     srcfd = Open(filename, O_RDONLY, 0);
-//     // 에러 처리 (주석 처리된 부분)
-//     // if (srcfd < 0) {
-//     //     perror("Open failed");
-//     //     return;
-//     // }
-
-//     // 파일 내용을 메모리로 읽기
-//     srcp = (char *)Malloc(filesize);
-//     if (Rio_readn(srcfd, srcp, filesize) < 0) {
-//         perror("Read failed");
-//         Free(srcp);
-//         Close(srcfd);
-//         return;
-//     }
-
-//     Close(srcfd);
-
-//     // 파일 내용을 클라이언트로 전송
-//     Rio_writen(fd, srcp, filesize);
-
-//     // 메모리 해제
-//     Free(srcp);
-// }
 
 /*
  * get_filetype - Derive file type from filename
