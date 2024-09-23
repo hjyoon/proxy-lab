@@ -7,6 +7,12 @@
  *   - Fixed sprintf() aliasing issue in serve_static(), and clienterror().
  */
 #include "csapp.h"
+#include "sbuf.h"
+
+#define NTHREADS 4
+#define SBUFSIZE 16
+
+sbuf_t sbuf;
 
 void doit(int fd);
 void read_requesthdrs(rio_t *rp);
@@ -17,18 +23,19 @@ void serve_dynamic(int fd, char *filename, char *cgiargs, int no_body);
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
 
 /* Thread routine */
-void* thread(void* vargp) {
-  int connfd = *((int*)vargp);
+void thread(void* vargp) {
   Pthread_detach(pthread_self());
-  Free(vargp);
-  doit(connfd);
-  Close(connfd);
-  return NULL;
+  while(1) {
+    int connfd = sbuf_remove(&sbuf);
+    // Free(vargp);
+    doit(connfd);
+    Close(connfd);
+  }
 }
 
 int main(int argc, char* argv[]) {
-  int listenfd;
-  int* connfdp;
+  int listenfd, connfd;
+  // int* connfdp;
   char hostname[MAXLINE], port[MAXLINE];
   socklen_t clientlen;
   struct sockaddr_storage clientaddr;
@@ -41,18 +48,26 @@ int main(int argc, char* argv[]) {
   }
 
   listenfd = Open_listenfd(argv[1]);
+
+  sbuf_init(&sbuf, SBUFSIZE);
+  for(int i=0; i<NTHREADS; i++) { /* Create worker threads */
+    Pthread_create(&tid, NULL, thread, NULL);
+  }
+
+
   while (1) {
     // clientlen = sizeof(clientaddr);
     // connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);  // line:netp:tiny:accept
     // Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
     // printf("Accepted connection from (%s, %s)\n", hostname, port);
 
-    clientlen = sizeof(clientlen);
-    connfdp = Malloc(sizeof(int));
-    *connfdp = Accept(listenfd, (SA*)&clientaddr, &clientlen);
+    clientlen = sizeof(clientaddr);
+    // connfdp = Malloc(sizeof(int));
+    connfd = Accept(listenfd, (SA*)&clientaddr, &clientlen);
     Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
     printf("Accepted connection from (%s, %s)\n", hostname, port);
-    Pthread_create(&tid, NULL, thread, connfdp);
+    sbuf_insert(&sbuf, connfd);
+    // Pthread_create(&tid, NULL, thread, connfdp);
 
     // if (Fork() == 0) {
     //   Close(listenfd);

@@ -1,10 +1,16 @@
 #include "csapp.h"
+#include "sbuf.h"
+
+#define NTHREADS 4
+#define SBUFSIZE 16
 
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+sbuf_t sbuf;
 
 /* User-Agent header */
 static const char *user_agent_hdr =
@@ -18,19 +24,19 @@ void handle_response(int serverfd, int clientfd);
 void send_error(int clientfd, int status, const char *short_msg, const char *long_msg);
 
 /* Thread routine */
-void* thread(void* vargp) {
-    int connfd = *((int*)vargp);
+void thread(void* vargp) {
     Pthread_detach(pthread_self());
-    Free(vargp);
-    forward_request(connfd);
-    Close(connfd);
-    return NULL;
+    while(1) {
+        int connfd = sbuf_remove(&sbuf);
+        // Free(vargp);
+        forward_request(connfd);
+        Close(connfd);
+    }
 }
 
 /* Main function: listens for incoming connections and forwards requests */
 int main(int argc, char* argv[]) {
-    int listenfd;
-    int* connfdp;
+    int listenfd, connfd;
     char hostname[MAXLINE], port[MAXLINE];
     socklen_t clientlen;
     struct sockaddr_storage clientaddr;
@@ -50,13 +56,18 @@ int main(int argc, char* argv[]) {
         exit(1);
     }
 
+    sbuf_init(&sbuf, SBUFSIZE);
+    for(int i=0; i<NTHREADS; i++) { /* Create worker threads */
+        Pthread_create(&tid, NULL, thread, NULL);
+    }
+
     while (1) {
         clientlen = sizeof(struct sockaddr_storage);
-        connfdp = Malloc(sizeof(int));
-        *connfdp = Accept(listenfd, (SA*)&clientaddr, &clientlen);
+        connfd = Accept(listenfd, (SA*)&clientaddr, &clientlen);
         Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
         printf("Accepted connection from (%s, %s)\n", hostname, port);
-        Pthread_create(&tid, NULL, thread, connfdp);
+        sbuf_insert(&sbuf, connfd);
+        // Pthread_create(&tid, NULL, thread, connfdp);
     }
 
     /* Close(listenfd); */ /* Unreachable 코드 */

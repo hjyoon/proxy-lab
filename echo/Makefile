@@ -1,7 +1,10 @@
 CC = gcc
 CFLAGS = -O2 -Wall
 
-all: echoservert echoservers select echoserverp echoserveri echoclient
+all: echoservert-pre echoservert echoservers select echoserverp echoserveri echoclient
+
+echoservert-pre: echoservert-pre.c sbuf.o echo-cnt.o csapp.o
+	$(CC) $(CFLAGS) -o echoservert-pre echoservert-pre.c sbuf.o echo-cnt.o csapp.o
 
 echoservert: echoservert.c echo.o csapp.o
 	$(CC) $(CFLAGS) -o echoservert echoservert.c echo.o csapp.o
@@ -24,8 +27,14 @@ echoclient: echoclient.c csapp.o
 echo.o: echo.c
 	$(CC) $(CFLAGS) -o echo.o -c echo.c
 
+echo-cnt.o: echo-cnt.c
+	$(CC) $(CFLAGS) -o echo-cnt.o -c echo-cnt.c
+
+sbuf.o: sbuf.c
+	$(CC) $(CFLAGS) -o sbuf.o -c sbuf.c
+
 csapp.o: csapp.c
 	$(CC) $(CFLAGS) -c csapp.c
 
 clean:
-	rm -f *.o echoservert echoservers select echoserverp echoserveri echoclient
+	rm -f *.o echoservert-pre echoservert echoservers select echoserverp echoserveri echoclient
