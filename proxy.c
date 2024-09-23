@@ -5,12 +5,28 @@
 #define SBUFSIZE 16
 
 /* Recommended max cache and object sizes */
-#define MAX_CACHE_SIZE 1049000
+#define MAX_CACHE_SIZE 1024 * 1024 * 1024 * 5 /* 5 MB */
 #define MAX_OBJECT_SIZE 102400
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 sbuf_t sbuf;
+
+typedef struct cache_entry {
+    char uri[MAXLINE];
+    char *content;
+    int content_length;
+    struct cache_entry *next;
+} cache_entry_t;
+
+typedef struct {
+    cache_entry_t *head;      // 가장 오래된 항목
+    cache_entry_t *tail;      // 가장 최근 항목
+    int total_size;           // 현재 캐시의 총 크기
+    sem_t sem;     // 동기화를 위한 뮤텍스
+} cache_t;
+
+cache_t cache;
 
 /* User-Agent header */
 static const char *user_agent_hdr =
@@ -28,9 +44,99 @@ void thread(void* vargp) {
     Pthread_detach(pthread_self());
     while(1) {
         int connfd = sbuf_remove(&sbuf);
-        // Free(vargp);
         forward_request(connfd);
         Close(connfd);
+    }
+}
+
+void cache_init() {
+    cache.head = NULL;
+    cache.tail = NULL;
+    cache.total_size = 0;
+    if (sem_init(&cache.sem, 0, 1) != 0) { // 세마포어 초기화
+        perror("sem_init failed");
+        exit(1);
+    }
+}
+
+int cache_lookup(const char *uri, char **content, int *content_length) {
+    if (sem_wait(&cache.sem) < 0) { // 세마포어 대기 (잠금)
+        perror("sem_wait failed");
+        return 0;
+    }
+
+    cache_entry_t *current = cache.head;
+    while (current != NULL) {
+        if (strcmp(current->uri, uri) == 0) {
+            *content = current->content;
+            *content_length = current->content_length;
+            if (sem_post(&cache.sem) < 0) { // 세마포어 해제 (잠금 해제)
+                perror("sem_post failed");
+            }
+            return 1; // 캐시 히트
+        }
+        current = current->next;
+    }
+
+    if (sem_post(&cache.sem) < 0) { // 세마포어 해제 (잠금 해제)
+        perror("sem_post failed");
+    }
+    return 0; // 캐시 미스
+}
+
+
+void cache_insert(const char *uri, const char *content, int content_length) {
+    if (sem_wait(&cache.sem) < 0) { // 세마포어 대기 (잠금)
+        perror("sem_wait failed");
+        return;
+    }
+
+    // 캐시 용량 초과 시 FIFO 방식으로 항목 제거
+    while (cache.total_size + content_length > MAX_CACHE_SIZE) {
+        if (cache.head == NULL) {
+            break; // 캐시가 비어있다면 중단
+        }
+        cache_entry_t *old = cache.head;
+        cache.head = old->next;
+        cache.total_size -= old->content_length;
+        free(old->content);
+        free(old);
+    }
+
+    // 새로운 캐시 항목 생성
+    cache_entry_t *new_entry = malloc(sizeof(cache_entry_t));
+    if (new_entry == NULL) {
+        fprintf(stderr, "캐시 항목 메모리 할당 실패\n");
+        if (sem_post(&cache.sem) < 0) { // 세마포어 해제
+            perror("sem_post failed");
+        }
+        return;
+    }
+    strncpy(new_entry->uri, uri, MAXLINE);
+    new_entry->content = malloc(content_length);
+    if (new_entry->content == NULL) {
+        fprintf(stderr, "캐시 콘텐츠 메모리 할당 실패\n");
+        free(new_entry);
+        if (sem_post(&cache.sem) < 0) { // 세마포어 해제
+            perror("sem_post failed");
+        }
+        return;
+    }
+    memcpy(new_entry->content, content, content_length);
+    new_entry->content_length = content_length;
+    new_entry->next = NULL;
+
+    // 캐시에 항목 추가
+    if (cache.tail == NULL) {
+        cache.head = cache.tail = new_entry;
+    } else {
+        cache.tail->next = new_entry;
+        cache.tail = new_entry;
+    }
+    cache.total_size += content_length;
+
+    if (sem_post(&cache.sem) < 0) { // 세마포어 해제
+        perror("sem_post failed");
     }
 }
 
@@ -57,6 +163,8 @@ int main(int argc, char* argv[]) {
     }
 
     sbuf_init(&sbuf, SBUFSIZE);
+    cache_init();
+
     for(int i=0; i<NTHREADS; i++) { /* Create worker threads */
         Pthread_create(&tid, NULL, thread, NULL);
     }
@@ -67,10 +175,9 @@ int main(int argc, char* argv[]) {
         Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
         printf("Accepted connection from (%s, %s)\n", hostname, port);
         sbuf_insert(&sbuf, connfd);
-        // Pthread_create(&tid, NULL, thread, connfdp);
     }
 
-    /* Close(listenfd); */ /* Unreachable 코드 */
+    /* Close(listenfd); */
     return 0;
 }
 
@@ -134,13 +241,14 @@ void send_error(int clientfd, int status, const char *short_msg, const char *lon
     Rio_writen(clientfd, body, strlen(body));
 }
 
-/* Function to forward the client's request to the target server */
 void forward_request(int clientfd) {
     char buf[MAXLINE];
     char method_buf[MAXLINE], uri[MAXLINE], version_buf[MAXLINE];
     char host[MAXLINE], port_num[MAXLINE], path_buf[MAXLINE];
     rio_t rio_client;
     int serverfd;
+    char *cache_content;
+    int cache_content_length;
 
     /* Initialize rio for client */
     Rio_readinitb(&rio_client, clientfd);
@@ -163,6 +271,13 @@ void forward_request(int clientfd) {
     if (strcasecmp(method_buf, "GET")) {
         fprintf(stderr, "Unsupported method: %s\n", method_buf);
         send_error(clientfd, 501, "Not Implemented", "Proxy does not implement this method");
+        return;
+    }
+
+    /* 캐시 조회 */
+    if (cache_lookup(uri, &cache_content, &cache_content_length)) {
+        printf("Cache hit for URI: %s\n", uri);
+        Rio_writen(clientfd, cache_content, cache_content_length);
         return;
     }
 
@@ -225,10 +340,38 @@ void forward_request(int clientfd) {
     Rio_writen(serverfd, "\r\n", 2); /* End of headers */
 
     /* Handle the response from the server and send it back to the client */
-    handle_response(serverfd, clientfd);
+    // 응답을 메모리에 저장하여 캐시에 추가
+    // 이를 위해 응답을 버퍼에 저장해야 합니다.
+
+    // 임시 버퍼
+    char *response_buf = malloc(MAX_CACHE_SIZE);
+    if (response_buf == NULL) {
+        fprintf(stderr, "메모리 할당 실패\n");
+        Close(serverfd);
+        return;
+    }
+    int total_received = 0;
+    int n;
+
+    rio_t rio_temp;
+    Rio_readinitb(&rio_temp, serverfd);
+
+    /* Read response headers and body */
+    while ((n = Rio_readnb(&rio_temp, buf, MAXLINE)) > 0) {
+        Rio_writen(clientfd, buf, n);
+        if (total_received + n <= MAX_CACHE_SIZE) {
+            memcpy(response_buf + total_received, buf, n);
+            total_received += n;
+        }
+    }
+
+    /* 캐시에 저장 */
+    cache_insert(uri, response_buf, total_received);
+    free(response_buf);
 
     Close(serverfd);
 }
+
 
 /* Function to handle the server's response and forward it to the client */
 void handle_response(int serverfd, int clientfd) {
@@ -265,7 +408,9 @@ void handle_response(int serverfd, int clientfd) {
         while (remaining > 0) {
             int to_read = MIN(remaining, MAXLINE);
             n = Rio_readnb(&rio, buf, to_read);
-            if (n <= 0) break;
+            if (n <= 0) {
+                break;
+            }
             Rio_writen(clientfd, buf, n);
             remaining -= n;
         }
